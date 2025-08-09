@@ -7,6 +7,8 @@ import base64
 from datetime import datetime, timedelta
 from typing import Annotated, Optional, List, Dict, Any
 from dotenv import load_dotenv
+import re
+from datetime import datetime, timedelta
 
 # Enhanced imports with error handling
 try:
@@ -16,7 +18,29 @@ except ImportError as e:
     print(f"❌ FastMCP import error: {e}")
     print("💡 Try: pip install fastmcp")
     exit(1)
+    
+# Add to your existing imports
+try:
+    from twilio.rest import Client
+    TWILIO_AVAILABLE = True
+except ImportError:
+    print("⚠️ Twilio not installed. SMS notifications disabled.")
+    TWILIO_AVAILABLE = False
+    
+# --- Twilio Configuration ---
+TWILIO_ACCOUNT_SID = 'AC95004721f6caef5f49dfef556a688f8e'
+TWILIO_AUTH_TOKEN = '917d5574536627dd19e694b003ead27d'
+TWILIO_PHONE_NUMBER = '+18086462203'  # Your Twilio phone number
+print(f"TWILIO_PHONE_NUMBER: {TWILIO_PHONE_NUMBER}, TWILIO_ACCOUNT_SID: {TWILIO_ACCOUNT_SID}, TWILIO_AUTH_TOKEN: {TWILIO_AUTH_TOKEN}")
 
+# Initialize Twilio client
+if TWILIO_AVAILABLE and all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER]):
+    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    print(f"✅ Twilio initialized with number: {TWILIO_PHONE_NUMBER}")
+else:
+    twilio_client = None
+    print("⚠️ Twilio not configured. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER")
+    
 from mcp import ErrorData, McpError
 from mcp.server.auth.provider import AccessToken
 from mcp.types import TextContent, INVALID_PARAMS, INTERNAL_ERROR
@@ -560,6 +584,134 @@ async def register_driver(
            f"🆔 **Driver ID**: {driver_id}"
 
 # --- Enhanced Listing Creation ---
+
+async def notify_nearby_ngos_via_push_ai(listing_data: dict, matched_ngos: List[Dict]):
+    """Send WhatsApp notifications to nearby NGOs via Push AI"""
+    
+    if not matched_ngos:
+        print("📱 [PUSH_AI] No NGOs to notify")
+        return
+    
+    # Prepare notification message
+    message = f"""🍽️ *New Food Available!*
+
+🏪 *Restaurant*: {listing_data['restaurant_name']}
+🍲 *Food*: {listing_data['description']}
+📦 *Quantity*: {listing_data['quantity']} {listing_data['unit']}
+⏰ *Pickup*: {listing_data['pickup_window']}
+📍 *Address*: {listing_data['restaurant_address']}
+
+💡 Reply with "CLAIM {listing_data['listing_id']}" to claim this listing!
+
+🆔 Listing ID: {listing_data['listing_id']}"""
+    
+    # Send to each NGO
+    for ngo in matched_ngos:
+        try:
+            # This will be handled by Push AI talking to your MCP
+            simulate_whatsapp_notification(
+                ngo['phone'],
+                "new_listing_available",
+                {
+                    "restaurant_name": listing_data['restaurant_name'],
+                    "food_description": listing_data['description'],
+                    "quantity": f"{listing_data['quantity']} {listing_data['unit']}",
+                    "pickup_window": listing_data['pickup_window'],
+                    "listing_id": listing_data['listing_id'],
+                    "distance": f"{ngo['distance_km']} km",
+                    "message": message
+                }
+            )
+            print(f"📱 [PUSH_AI] Notified {ngo['name']} at {ngo['phone']}")
+            
+        except Exception as e:
+            print(f"❌ [PUSH_AI] Failed to notify {ngo['phone']}: {e}")
+
+
+async def send_sms_notification(phone: str, message: str) -> dict:
+    """Send SMS notification via Twilio"""
+    
+    if not twilio_client:
+        print(f"❌ [SMS] Twilio not configured, cannot send to {phone}")
+        return {"status": "error", "message": "Twilio not configured"}
+    
+    try:
+        # Format phone number (ensure it starts with +)
+        if not phone.startswith('+'):
+            phone = '+' + phone.lstrip('+')
+        
+        # Send SMS
+        message_obj = twilio_client.messages.create(
+            body=message,
+            from_=TWILIO_PHONE_NUMBER,
+            to=phone
+        )
+        
+        print(f"✅ [SMS] Sent to {phone}, SID: {message_obj.sid}")
+        return {
+            "status": "sent", 
+            "message_id": message_obj.sid,
+            "phone": phone
+        }
+        
+    except Exception as e:
+        print(f"❌ [SMS] Failed to send to {phone}: {str(e)}")
+        return {
+            "status": "error", 
+            "message": str(e),
+            "phone": phone
+        }
+
+async def notify_nearby_ngos_via_sms(listing_data: dict, matched_ngos: List[Dict]):
+    """Send SMS notifications to nearby NGOs about new listing"""
+    
+    if not matched_ngos:
+        print("📱 [SMS] No NGOs to notify")
+        return []
+    
+    # Prepare SMS message (keep it concise for SMS)
+    message = f"""🍽️ NEW FOOD AVAILABLE!
+
+Restaurant: {listing_data['restaurant_name']}
+Food: {listing_data['description']}
+Qty: {listing_data['quantity']} {listing_data['unit']}
+Pickup: {listing_data['pickup_window']}
+Distance: {{distance}}
+
+To claim: Reply "CLAIM {listing_data['listing_id']}"
+
+ID: {listing_data['listing_id']}"""
+    
+    # Send to each NGO
+    results = []
+    for ngo in matched_ngos:
+        try:
+            # Customize message with NGO-specific distance
+            personalized_message = message.replace('{distance}', f"{ngo['distance_km']} km away")
+            
+            result = await send_sms_notification(ngo['phone'], personalized_message)
+            results.append(result)
+            
+            # Log the notification
+            db.log_event("notification", listing_data['listing_id'], "sms_sent", {
+                "ngo_id": ngo['id'],
+                "ngo_phone": ngo['phone'],
+                "status": result['status']
+            })
+            
+        except Exception as e:
+            print(f"❌ [SMS] Failed to notify {ngo['name']} at {ngo['phone']}: {e}")
+            results.append({
+                "status": "error",
+                "phone": ngo['phone'],
+                "message": str(e)
+            })
+    
+    successful_sends = sum(1 for r in results if r['status'] == 'sent')
+    print(f"📱 [SMS] Sent {successful_sends}/{len(matched_ngos)} notifications successfully")
+    
+    return results
+
 @mcp.tool
 async def create_smart_listing(
     restaurant_phone: Annotated[str, Field(description="Restaurant phone number")],
@@ -570,14 +722,14 @@ async def create_smart_listing(
     expires_hours: Annotated[int, Field(description="Hours from now when food expires", default=6)],
     food_category: Annotated[str, Field(description="Category (meals/groceries/baked)", default="meals")],
     dietary_info: Annotated[List[str], Field(description="Dietary info (vegetarian/vegan/etc)", default_factory=list)],
-    auto_match: Annotated[bool, Field(description="Enable auto-matching", default=True)]
+    auto_match: Annotated[bool, Field(description="Enable auto-matching and SMS notifications", default=True)]
 ) -> str:
-    """Create a new food listing with smart features"""
+    """Create a new food listing with smart features and SMS notifications to nearby NGOs"""
     
     # Verify restaurant exists
     with db.get_connection() as conn:
         cursor = conn.execute('''
-            SELECT r.id, r.name 
+            SELECT r.id, r.name, r.address
             FROM restaurants r
             JOIN user_permissions p ON r.phone = p.phone
             WHERE r.phone = ? AND p.role = ?
@@ -594,8 +746,8 @@ async def create_smart_listing(
     pickup_end = pickup_start + timedelta(hours=pickup_hours)
     expires_at = now + timedelta(hours=expires_hours)
     
+    # Create enhanced listing
     with db.get_connection() as conn:
-        # Create enhanced listing
         conn.execute('''
             INSERT INTO listings (
                 id, restaurant_id, description, quantity, unit,
@@ -620,34 +772,120 @@ async def create_smart_listing(
         
         conn.commit()
     
+    # Log listing creation
     db.log_event("listing", listing_id, "created", {
         "restaurant_id": restaurant['id'],
         "quantity": quantity,
-        "auto_match": auto_match
+        "auto_match": auto_match,
+        "food_category": food_category
     })
     
-    # If auto-match enabled, find matches
-    if auto_match:
-        matched_ngos = await _find_matching_ngos(listing_id)
-        match_count = len(matched_ngos)
-    else:
-        match_count = 0
+    # Enhanced auto-matching with SMS notifications
+    matched_ngos = []
+    sms_results = []
+    successful_notifications = 0
     
-    return f"✅ **Smart Listing Created!**\n\n" \
-           f"🍽️ **Food**: {description}\n" \
-           f"📦 **Quantity**: {quantity} {unit}\n" \
-           f"⏰ **Pickup Window**: {pickup_start.strftime('%H:%M')}-{pickup_end.strftime('%H:%M')}\n" \
-           f"🏢 **Restaurant**: {restaurant['name']}\n" \
-           f"🤖 **Auto-Match**: {'ON' if auto_match else 'OFF'}\n" \
-           f"🎯 **Matched NGOs**: {match_count}\n\n" \
-           f"🆔 **Listing ID**: {listing_id}"
+    if auto_match:
+        print(f"🔍 [MATCHING] Finding nearby NGOs for listing {listing_id}")
+        matched_ngos = await _find_matching_ngos(listing_id)
+        print(f"🔍 [MATCHING] Found {len(matched_ngos)} NGOs for listing {listing_id}")
+        if matched_ngos:
+            print(f"📱 [SMS] Found {len(matched_ngos)} nearby NGOs, sending notifications...")
+            
+            # Prepare listing data for SMS notifications
+            listing_data = {
+                "listing_id": listing_id,
+                "restaurant_name": restaurant['name'],
+                "description": description,
+                "quantity": quantity,
+                "unit": unit,
+                "pickup_window": f"{pickup_start.strftime('%H:%M')}-{pickup_end.strftime('%H:%M')}",
+                "restaurant_address": restaurant['address'] or "Address not available",
+                "expires_at": expires_at.strftime('%H:%M'),
+                "food_category": food_category,
+                "dietary_info": dietary_info
+            }
+            
+            # Send SMS notifications to nearby NGOs
+            try:
+                sms_results = await notify_nearby_ngos_via_sms(listing_data, matched_ngos)
+                successful_notifications = sum(1 for r in sms_results if r.get('status') == 'sent')
+                
+                # Log successful notifications
+                if successful_notifications > 0:
+                    db.log_event("listing", listing_id, "sms_notifications_sent", {
+                        "total_ngos": len(matched_ngos),
+                        "successful_sends": successful_notifications,
+                        "failed_sends": len(sms_results) - successful_notifications
+                    })
+                
+            except Exception as e:
+                print(f"❌ [SMS] Error sending notifications: {e}")
+                # Still continue, just log the error
+                db.log_event("listing", listing_id, "sms_notification_error", {
+                    "error": str(e),
+                    "matched_ngos_count": len(matched_ngos)
+                })
+        else:
+            print(f"📭 [MATCHING] No nearby NGOs found for listing {listing_id}")
+    
+    match_count = len(matched_ngos)
+    
+    # Build detailed response
+    result_message = f"✅ **Smart Listing Created Successfully!**\n\n"
+    result_message += f"🍽️ **Food**: {description}\n"
+    result_message += f"📦 **Quantity**: {quantity} {unit}\n"
+    result_message += f"🏷️ **Category**: {food_category.title()}\n"
+    
+    if dietary_info:
+        result_message += f"🥗 **Dietary Info**: {', '.join(dietary_info)}\n"
+    
+    result_message += f"⏰ **Pickup Window**: {pickup_start.strftime('%H:%M')}-{pickup_end.strftime('%H:%M')}\n"
+    result_message += f"⏳ **Expires At**: {expires_at.strftime('%H:%M')}\n"
+    result_message += f"🏢 **Restaurant**: {restaurant['name']}\n"
+    result_message += f"📍 **Address**: {restaurant['address']}\n\n"
+    
+    # Auto-matching and notification results
+    result_message += f"🤖 **Auto-Match**: {'✅ ON' if auto_match else '❌ OFF'}\n"
+    
+    if auto_match:
+        result_message += f"🎯 **Nearby NGOs Found**: {match_count}\n"
+        
+        if match_count > 0:
+            result_message += f"📱 **SMS Notifications**: {successful_notifications}/{match_count} sent\n"
+            
+            # Show which NGOs were notified
+            if successful_notifications > 0:
+                result_message += f"\n📋 **Notified NGOs**:\n"
+                for i, (ngo, sms_result) in enumerate(zip(matched_ngos, sms_results), 1):
+                    status_emoji = "✅" if sms_result.get('status') == 'sent' else "❌"
+                    result_message += f"{i}. {status_emoji} {ngo['name']} ({ngo['distance_km']}km)\n"
+            
+            if successful_notifications < match_count:
+                failed_count = match_count - successful_notifications
+                result_message += f"\n⚠️ **Failed SMS**: {failed_count} notifications failed to send\n"
+        else:
+            result_message += f"📭 **No nearby NGOs found** (within 15km radius)\n"
+    else:
+        result_message += f"📢 **Manual Mode**: NGOs must discover this listing themselves\n"
+    
+    result_message += f"\n🆔 **Listing ID**: `{listing_id}`\n"
+    result_message += f"🔗 **Status**: Available for claiming"
+    
+    # Add helpful tips
+    if auto_match and successful_notifications > 0:
+        result_message += f"\n\n💡 **Next Steps**: NGOs can claim by replying 'CLAIM {listing_id}' to SMS or using the claim tool"
+    elif auto_match and match_count == 0:
+        result_message += f"\n\n💡 **Tip**: Try expanding your pickup window or check if your restaurant location is set correctly"
+    
+    return result_message
 
 async def _find_matching_ngos(listing_id: str) -> List[Dict]:
     """Find matching NGOs for a listing"""
     with db.get_connection() as conn:
-        # Get listing details
+        # Get listing details with restaurant info
         cursor = conn.execute('''
-            SELECT l.*, r.geo_lat, r.geo_lng
+            SELECT l.*, r.geo_lat, r.geo_lng, r.address as restaurant_address
             FROM listings l
             JOIN restaurants r ON l.restaurant_id = r.id
             WHERE l.id = ?
@@ -657,7 +895,7 @@ async def _find_matching_ngos(listing_id: str) -> List[Dict]:
         if not listing:
             return []
         
-        # Get all NGOs
+        # Get all verified NGOs with phone numbers
         cursor = conn.execute('''
             SELECT n.id, n.name, n.phone, n.geo_lat, n.geo_lng, 
                    n.daily_meal_capacity, n.service_areas
@@ -665,35 +903,42 @@ async def _find_matching_ngos(listing_id: str) -> List[Dict]:
             JOIN user_permissions p ON n.phone = p.phone
             WHERE p.role = ?
             AND n.verification_status = 'verified'
-        ''', (NGO_ROLE,))
+        ''', (NGO_ROLE))
         ngos = cursor.fetchall()
-    
+        print(f"🔍 [MATCHING] Found {len(ngos)} NGOs for listing {listing_id}")
+
     matched = []
     for ngo in ngos:
         # Calculate distance if coordinates exist
-        if listing.get('geo_lat') and ngo.get('geo_lat'):
-            distance = calculate_distance(
-                listing['geo_lat'], listing['geo_lng'],
-                ngo['geo_lat'], ngo['geo_lng']
-            )
-        else:
-            distance = 5.0  # Default distance if no coordinates
+        # if listing.get('geo_lat') and ngo.get('geo_lat'):
+        #     distance = calculate_distance(
+        #         listing['geo_lat'], listing['geo_lng'],
+        #         ngo['geo_lat'], ngo['geo_lng']
+        #     )
+        # else:
+        #     distance = 5.0  # Default distance if no coordinates
         
-        # Simple matching logic (can be enhanced)
-        if distance <= 15:  # Within 15km
-            matched.append({
-                "id": ngo['id'],
-                "name": ngo['name'],
-                "distance_km": round(distance, 2),
-                "capacity": ngo['daily_meal_capacity']
-            })
+        # # Enhanced matching logic
+        # if distance <= 50:  # Within 15km
+        #     matched.append({
+        #         "id": ngo['id'],
+        #         "name": ngo['name'],
+        #         "phone": ngo['phone'],  # Added phone for notifications
+        #         "distance_km": round(distance, 2),
+        #         "capacity": ngo['daily_meal_capacity']
+        #     })
+        matched.append({
+            "id": ngo['id'],
+            "name": ngo['name'],
+            "phone": ngo['phone'],  # Added phone for notifications
+            "distance_km": round(213, 2),
+            "capacity": ngo['daily_meal_capacity']
+        })
     
     return matched
 
 # --- Enhanced Claim System ---
 
-import re
-from datetime import datetime, timedelta
 
 def parse_time_input(time_str: str) -> datetime:
     """Parse various time formats and return pickup time"""
@@ -1351,16 +1596,41 @@ def calculate_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> fl
     return R * c
 
 def simulate_whatsapp_notification(phone: str, template_id: str, variables: dict):
-    """Simulate WhatsApp notification (replace with actual API)"""
-    print(f"📱 [WHATSAPP] Sending '{template_id}' to {phone}")
-    print(f"📱 [WHATSAPP] Variables: {variables}")
+    """Enhanced WhatsApp notification with Push AI integration"""
+    
+    # Format message based on template
+    if template_id == "new_listing_available":
+        message_text = variables.get('message', 'New food listing available!')
+        
+        print(f"📱 [PUSH_AI → WhatsApp] Sending to {phone}")
+        print(f"📱 [PUSH_AI] Template: {template_id}")
+        print(f"📱 [PUSH_AI] Message: {message_text[:100]}...")
+        
+        # Here's where Push AI would integrate with your MCP
+        # Push AI will receive this notification data and format it for WhatsApp
+        notification_payload = {
+            "recipient": phone,
+            "template": template_id,
+            "variables": variables,
+            "priority": "high",
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # Log for Push AI to process
+        print(f"📱 [PUSH_AI] Payload ready: {json.dumps(notification_payload, indent=2)}")
+        
+    else:
+        # Handle other notification types
+        print(f"📱 [WHATSAPP] Sending '{template_id}' to {phone}")
+        print(f"📱 [WHATSAPP] Variables: {variables}")
+    
     return {"status": "sent", "message_id": f"msg_{uuid.uuid4()}"}
 
 # --- Main Execution ---
 async def main():
     print("🚀 Starting Food Waste MCP v2 Server...")
     print(f"🔗 Server URL: http://0.0.0.0:8087")
-    print(f"🔐 Auth Token: {os.environ.get('AUTH_TOKEN', 'demo_token_123')}")
+    print(f"🔐 Auth Token: {os.environ.get('AUTH_TOKEN', 'abc123')}")
     print(f"👑 Platform Admin: {os.environ.get('MY_NUMBER', '+1234567890')}")
     print("=" * 50)
     
