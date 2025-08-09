@@ -341,7 +341,7 @@ async def create_listing(
     expires_hours: Annotated[int, Field(description="Hours from now when food expires", default=6)],
     pickup_instructions: Annotated[str, Field(description="Special pickup instructions", default="")]
 ) -> str:
-    """Create a new food listing"""
+    """Create a new food listing (Normal Users)"""
     
     print(f"🍽️ [CREATE_LISTING] Starting listing creation for {donor_name}")
     print(f"🍽️ [CREATE_LISTING] Food: {description} ({quantity} {unit})")
@@ -455,7 +455,7 @@ async def get_listings(
     radius_km: Annotated[float, Field(description="Search radius in kilometers", default=10.0)],
     limit: Annotated[int, Field(description="Maximum number of results", default=10)]
 ) -> str:
-    """Get available food listings"""
+    """Get available food listings (NGOs)"""
     
     print(f"🔍 [GET_LISTINGS] Searching for {status} listings within {radius_km}km")
     
@@ -511,7 +511,7 @@ async def claim_listing(
     ngo_phone: Annotated[str, Field(description="NGO contact phone")],
     estimated_pickup_time: Annotated[str, Field(description="Estimated pickup time (HH:MM)", default="")]
 ) -> str:
-    """Claim a food listing for pickup"""
+    """Claim a food listing for pickup (NGOs)"""
     
     print(f"🤝 [CLAIM_LISTING] NGO {ngo_name} claiming listing {listing_id}")
     
