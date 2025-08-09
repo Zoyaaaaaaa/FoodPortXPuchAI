@@ -71,7 +71,7 @@ class DriverCreate(BaseModel):
 
 # --- Database Upgrade ---
 class Database:
-    def __init__(self, db_path: str = "food_waste_v2.db"):
+    def __init__(self, db_path: str = "DB_v2.db"):
         self.db_path = db_path
         print(f"📊 [DBv2] Initializing multi-tenant database: {db_path}")
         self.init_database()
@@ -585,7 +585,7 @@ async def create_smart_listing(
         restaurant = cursor.fetchone()
         
         if not restaurant:
-            raise McpError(ErrorData(code="NOT_FOUND", 
+            raise McpError(ErrorData(code=403, 
                                  message="Restaurant not found or not registered"))
     
     listing_id = str(uuid.uuid4())
@@ -691,14 +691,65 @@ async def _find_matching_ngos(listing_id: str) -> List[Dict]:
     return matched
 
 # --- Enhanced Claim System ---
+
+import re
+from datetime import datetime, timedelta
+
+def parse_time_input(time_str: str) -> datetime:
+    """Parse various time formats and return pickup time"""
+    if not time_str:
+        return None
+    
+    # Clean the input
+    time_str = time_str.strip().lower()
+    today = datetime.now().date()
+    
+    # Handle time ranges like "2-3pm", "14:30-15:00"
+    if '-' in time_str:
+        # Extract first time from range
+        time_str = time_str.split('-')[0].strip()
+    
+    # Handle PM/AM format
+    if 'pm' in time_str or 'am' in time_str:
+        # Remove pm/am and extract number
+        time_str = re.sub(r'[ap]m', '', time_str).strip()
+        is_pm = 'pm' in time_str.lower()
+        
+        # Handle formats like "2", "2:30", "14"
+        if ':' not in time_str:
+            hour = int(time_str)
+            minute = 0
+        else:
+            hour, minute = map(int, time_str.split(':'))
+        
+        # Convert to 24-hour format
+        if is_pm and hour < 12:
+            hour += 12
+        elif not is_pm and hour == 12:
+            hour = 0
+            
+        return datetime.combine(today, datetime.min.time().replace(hour=hour, minute=minute))
+    
+    # Handle HH:MM format
+    elif ':' in time_str:
+        return datetime.combine(today, datetime.strptime(time_str, "%H:%M").time())
+    
+    # Handle single number (assume 24-hour)
+    elif time_str.isdigit():
+        hour = int(time_str)
+        return datetime.combine(today, datetime.min.time().replace(hour=hour))
+    
+    else:
+        raise ValueError(f"Cannot parse time format: {time_str}")
+
 @mcp.tool
 async def claim_listing(
     ngo_phone: Annotated[str, Field(description="NGO phone number")],
     listing_id: Annotated[str, Field(description="Listing ID to claim")],
-    estimated_pickup_time: Annotated[str, Field(description="Estimated pickup time (HH:MM)", default="")],
+    estimated_pickup_time: Annotated[str, Field(description="Estimated pickup time (flexible format)", default="")],
     special_requests: Annotated[str, Field(description="Special instructions", default="")]
 ) -> str:
-    """Claim a listing with enhanced workflow"""
+    """Claim a listing with enhanced workflow and smart time parsing"""
     
     # Verify NGO exists
     with db.get_connection() as conn:
@@ -711,8 +762,10 @@ async def claim_listing(
         ngo = cursor.fetchone()
         
         if not ngo:
-            raise McpError(ErrorData(code="NOT_FOUND", 
-                                 message="NGO not found or not registered"))
+            raise McpError(ErrorData(
+                code=INVALID_PARAMS,
+                message="NGO not found or not registered. Please register the NGO first."
+            ))
         
         # Get listing details
         cursor = conn.execute('''
@@ -724,22 +777,43 @@ async def claim_listing(
         listing = cursor.fetchone()
         
         if not listing:
-            raise McpError(ErrorData(code="NOT_FOUND", message="Listing not found"))
+            raise McpError(ErrorData(
+                code=INVALID_PARAMS,
+                message="Listing not found"
+            ))
         
         if listing['status'] != 'AVAILABLE':
-            raise McpError(ErrorData(code="INVALID_STATUS", 
-                                 message="Listing not available for claiming"))
+            raise McpError(ErrorData(
+                code=INVALID_PARAMS,
+                message=f"Listing not available for claiming. Current status: {listing['status']}"
+            ))
+        
+        # Check for existing claims
+        cursor = conn.execute('''
+            SELECT id FROM claims 
+            WHERE listing_id = ? AND ngo_id = ? AND status IN ('REQUESTED', 'ASSIGNED', 'PICKUP_IN_PROGRESS', 'PICKED', 'IN_TRANSIT')
+        ''', (listing_id, ngo['id']))
+        existing_claim = cursor.fetchone()
+        
+        if existing_claim:
+            raise McpError(ErrorData(
+                code=INVALID_PARAMS,
+                message="NGO already has an active claim for this listing"
+            ))
     
     claim_id = str(uuid.uuid4())
     pickup_time = None
+    parsed_time_display = "To be confirmed"
     
+    # Smart time parsing
     if estimated_pickup_time:
         try:
-            today = datetime.now().date()
-            pickup_time = datetime.combine(today, datetime.strptime(estimated_pickup_time, "%H:%M").time())
-        except ValueError:
-            raise McpError(ErrorData(code="INVALID_TIME", 
-                                 message="Invalid time format, use HH:MM"))
+            pickup_time = parse_time_input(estimated_pickup_time)
+            parsed_time_display = pickup_time.strftime("%H:%M") if pickup_time else "To be confirmed"
+        except (ValueError, TypeError) as e:
+            # Log the error but don't fail the claim
+            print(f"⚠️ Time parsing warning: {e}")
+            parsed_time_display = f"Raw input: {estimated_pickup_time}"
     
     with db.get_connection() as conn:
         # Create enhanced claim
@@ -769,29 +843,35 @@ async def claim_listing(
     db.log_event("claim", claim_id, "created", {
         "listing_id": listing_id,
         "ngo_id": ngo['id'],
-        "pickup_time": estimated_pickup_time
+        "pickup_time": estimated_pickup_time,
+        "parsed_time": parsed_time_display
     })
     
     # Notify restaurant
-    simulate_whatsapp_notification(
-        listing['restaurant_phone'],
-        "listing_claimed",
-        {
-            "ngo_name": ngo['name'],
-            "food_description": listing['description'],
-            "pickup_time": estimated_pickup_time or "ASAP"
-        }
-    )
+    try:
+        simulate_whatsapp_notification(
+            listing['restaurant_phone'],
+            "listing_claimed",
+            {
+                "ngo_name": ngo['name'],
+                "food_description": listing['description'],
+                "pickup_time": parsed_time_display
+            }
+        )
+    except Exception as e:
+        print(f"⚠️ Notification warning: {e}")
     
     return f"✅ **Listing Claimed Successfully!**\n\n" \
            f"🍽️ **Food**: {listing['description']}\n" \
            f"📦 **Quantity**: {listing['quantity']} {listing['unit']}\n" \
            f"🏢 **Restaurant**: {listing['restaurant_name']}\n" \
            f"🏛️ **NGO**: {ngo['name']}\n" \
-           f"⏰ **Pickup Time**: {estimated_pickup_time or 'To be confirmed'}\n" \
+           f"⏰ **Pickup Time**: {parsed_time_display}\n" \
+           f"📝 **Special Requests**: {special_requests or 'None'}\n" \
            f"🆔 **Claim ID**: {claim_id}\n\n" \
            f"🚛 Next step: Assign a driver to complete the pickup"
-
+           
+           
 # --- Real-Time Status Updates ---
 @mcp.tool
 async def update_claim_status(
@@ -804,24 +884,11 @@ async def update_claim_status(
 ) -> str:
     """Update claim status with location tracking"""
     
-    # Verify user has permissions
+    # Get claim details first
     with db.get_connection() as conn:
         cursor = conn.execute('''
-            SELECT p.role, p.entity_id 
-            FROM user_permissions p
-            JOIN claims c ON (p.entity_id = c.ngo_id OR p.entity_id = c.driver_id)
-            WHERE p.phone = ? AND c.id = ?
-        ''', (updated_by_phone, claim_id))
-        permission = cursor.fetchone()
-        
-        if not permission:
-            raise McpError(ErrorData(code="PERMISSION_DENIED", 
-                                 message="User not authorized to update this claim"))
-        
-        # Get claim details
-        cursor = conn.execute('''
-            SELECT c.*, l.restaurant_id, r.phone as restaurant_phone,
-                   n.phone as ngo_phone, d.phone as driver_phone
+            SELECT c.*, l.restaurant_id, r.phone as restaurant_phone, r.name as restaurant_name,
+                   n.phone as ngo_phone, n.name as ngo_name, d.phone as driver_phone, d.name as driver_name
             FROM claims c
             JOIN listings l ON c.listing_id = l.id
             JOIN restaurants r ON l.restaurant_id = r.id
@@ -832,7 +899,51 @@ async def update_claim_status(
         claim = cursor.fetchone()
         
         if not claim:
-            raise McpError(ErrorData(code="NOT_FOUND", message="Claim not found"))
+            raise McpError(ErrorData(
+                code=INVALID_PARAMS,
+                message="Claim not found"
+            ))
+        
+        # Check if user has permission to update this claim
+        # Allow NGO, assigned driver, or coordinators to update
+        cursor = conn.execute('''
+            SELECT p.role, p.entity_id 
+            FROM user_permissions p
+            WHERE p.phone = ?
+        ''', (updated_by_phone,))
+        user_permissions = cursor.fetchall()
+        
+        # Verify user can update this specific claim
+        can_update = False
+        user_role = None
+        
+        for perm in user_permissions:
+            # NGO that owns the claim
+            if perm['role'] == NGO_ROLE and perm['entity_id'] == claim['ngo_id']:
+                can_update = True
+                user_role = NGO_ROLE
+                break
+            # Driver assigned to the claim
+            elif perm['role'] == DRIVER_ROLE and perm['entity_id'] == claim['driver_id']:
+                can_update = True
+                user_role = DRIVER_ROLE
+                break
+            # Coordinators can update any claim
+            elif perm['role'] == COORDINATOR_ROLE:
+                can_update = True
+                user_role = COORDINATOR_ROLE
+                break
+            # Platform admin can update any claim
+            elif perm['role'] == PLATFORM_ADMIN_ROLE:
+                can_update = True
+                user_role = PLATFORM_ADMIN_ROLE
+                break
+        
+        if not can_update:
+            raise McpError(ErrorData(
+                code=INVALID_PARAMS,
+                message=f"User not authorized to update this claim. Only the claiming NGO, assigned driver, or coordinators can update status."
+            ))
     
     update_time = datetime.now().isoformat()
     
@@ -850,7 +961,7 @@ async def update_claim_status(
             status_update_id,
             claim_id,
             updated_by_phone,
-            permission['role'],
+            user_role,
             claim['status'],
             new_status,
             location_lat,
@@ -933,7 +1044,7 @@ async def update_claim_status(
         recipients.append(claim['restaurant_phone'])
     if claim['ngo_phone']:
         recipients.append(claim['ngo_phone'])
-    if claim['driver_phone']:
+    if claim['driver_phone'] and claim['driver_phone'] != updated_by_phone:
         recipients.append(claim['driver_phone'])
     
     for phone in recipients:
@@ -943,7 +1054,7 @@ async def update_claim_status(
             {
                 "claim_id": claim_id,
                 "new_status": new_status,
-                "updated_by": permission['role'],
+                "updated_by": user_role,
                 "timestamp": datetime.now().strftime("%H:%M")
             }
         )
@@ -951,10 +1062,11 @@ async def update_claim_status(
     return f"✅ **Status Updated Successfully!**\n\n" \
            f"🆔 **Claim ID**: {claim_id}\n" \
            f"🔄 **New Status**: {new_status}\n" \
-           f"👤 **Updated By**: {permission['role']}\n" \
+           f"👤 **Updated By**: {user_role} ({updated_by_phone})\n" \
            f"📅 **Time**: {datetime.now().strftime('%H:%M')}\n" \
+           f"📍 **Location**: {f'({location_lat}, {location_lng})' if location_lat else 'Not provided'}\n" \
+           f"📝 **Notes**: {notes or 'None'}\n" \
            f"📱 **Notifications Sent**: {len(recipients)} recipients"
-
 # --- Driver Assignment ---
 @mcp.tool
 async def assign_driver(
@@ -977,7 +1089,7 @@ async def assign_driver(
         permission = cursor.fetchone()
         
         if not permission:
-            raise McpError(ErrorData(code="PERMISSION_DENIED", 
+            raise McpError(ErrorData(code=403, 
                                  message="Only NGO staff or coordinators can assign drivers"))
         
         # Verify driver exists
@@ -990,7 +1102,7 @@ async def assign_driver(
         driver = cursor.fetchone()
         
         if not driver:
-            raise McpError(ErrorData(code="NOT_FOUND", 
+            raise McpError(ErrorData(code=403, 
                                  message="Driver not found or not registered"))
         
         # Get claim details
@@ -1004,7 +1116,7 @@ async def assign_driver(
         claim = cursor.fetchone()
         
         if not claim:
-            raise McpError(ErrorData(code="NOT_FOUND", message="Claim not found"))
+            raise McpError(ErrorData(code=403, message="Claim not found"))
         
         if claim['status'] != 'REQUESTED':
             raise McpError(ErrorData(code="INVALID_STATUS", 
@@ -1017,7 +1129,7 @@ async def assign_driver(
             today = datetime.now().date()
             pickup_time = datetime.combine(today, datetime.strptime(estimated_pickup_time, "%H:%M").time())
         except ValueError:
-            raise McpError(ErrorData(code="INVALID_TIME", 
+            raise McpError(ErrorData(code=403, 
                                  message="Invalid time format, use HH:MM"))
     
     with db.get_connection() as conn:
@@ -1277,4 +1389,4 @@ async def main():
 
 if __name__ == "__main__":
     load_dotenv()
-    asyncio.run(main())
+    asyncio.run(main()) 
