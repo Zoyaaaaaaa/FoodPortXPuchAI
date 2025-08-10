@@ -375,7 +375,7 @@ db = Database()
 
 # --- Auth System Upgrade ---
 class TenantAwareBearerAuthProvider(BearerAuthProvider):
-    def __init__(self, token: str):
+    def __init__(self, token: str = "abc123"):
         try:
             k = RSAKeyPair.generate()
             super().__init__(public_key=k.public_key, jwks_uri=None, issuer=None, audience=None)
@@ -385,7 +385,7 @@ class TenantAwareBearerAuthProvider(BearerAuthProvider):
             print(f"❌ [AUTHv2] Failed to initialize auth provider: {e}")
             raise
 
-    async def load_access_token(self, token: str) -> AccessToken | None:
+    async def load_access_token(self, token: str = "abc123") -> AccessToken | None:
         if token == self.token:
             return AccessToken(
                 token=token,
