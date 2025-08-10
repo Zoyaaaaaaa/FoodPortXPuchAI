@@ -1891,8 +1891,8 @@ async def food_waste_matchmakers(
             "assign_driver",
             "update_claim_status"
         ],
-        "Analytics & Gamification": [
-            "get_donation_leaderboard",
+        "Gamification": [
+            # "get_donation_leaderboard",
             "get_restaurant_leaderboard"
         ],
         "System": [
