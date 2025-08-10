@@ -28,11 +28,16 @@ except ImportError:
     TWILIO_AVAILABLE = False
     
 
-TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
-TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
-TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
+# TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
+# TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
+# TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 
-# print(f"TWILIO_PHONE_NUMBER: {TWILIO_PHONE_NUMBER}, TWILIO_ACCOUNT_SID: {TWILIO_ACCOUNT_SID}, TWILIO_AUTH_TOKEN: {TWILIO_AUTH_TOKEN}")
+# --- Twilio Configuration ---
+TWILIO_ACCOUNT_SID = 'AC95004721f6caef5f49dfef556a688f8e'
+TWILIO_AUTH_TOKEN = '917d5574536627dd19e694b003ead27d'
+TWILIO_PHONE_NUMBER = '+18086462203'
+
+print(f"TWILIO_PHONE_NUMBER: {TWILIO_PHONE_NUMBER}, TWILIO_ACCOUNT_SID: {TWILIO_ACCOUNT_SID}, TWILIO_AUTH_TOKEN: {TWILIO_AUTH_TOKEN}")
 
 # Initialize Twilio client
 if TWILIO_AVAILABLE and all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER]):
@@ -663,53 +668,117 @@ async def send_sms_notification(phone: str, message: str) -> dict:
             "phone": phone
         }
 
-async def notify_nearby_ngos_via_sms(listing_data: dict, matched_ngos: List[Dict]):
-    """Send SMS notifications to nearby NGOs about new listing"""
+async def notify_all_ngos_via_sms(listing_data: dict, all_ngos: List[Dict]):
+    """Send comprehensive SMS notifications to ALL NGOs with location information"""
     
-    if not matched_ngos:
-        print("📱 [SMS] No NGOs to notify")
+    if not all_ngos:
+        print("📱 [SMS_BROADCAST] No NGOs provided for notification")
         return []
     
-    # Prepare SMS message (keep it concise for SMS)
-    message = f"""🍽️ NEW FOOD AVAILABLE!
+    print(f"📝 [SMS_BROADCAST] Preparing comprehensive SMS template...")
+    
+    # Prepare comprehensive SMS message template (keep concise but informative)
+    base_message = f"""🍽️ NEW FOOD AVAILABLE!
 
-Restaurant: {listing_data['restaurant_name']}
-Food: {listing_data['description']}
-Qty: {listing_data['quantity']} {listing_data['unit']}
-Pickup: {listing_data['pickup_window']}
-Distance: {{distance}}
+🏪 {listing_data['restaurant_name']}
+📍 {listing_data['restaurant_address']}
+
+🍲 {listing_data['description']}
+📦 {listing_data['quantity']} {listing_data['unit']}
+🏷️ Category: {listing_data['food_category']}"""
+    
+    if listing_data['dietary_info']:
+        base_message += f"\n🥗 Diet: {', '.join(listing_data['dietary_info'])}"
+    
+    base_message += f"""
+⏰ Pickup: {listing_data['pickup_window']}
+⏳ Expires: {listing_data['expires_at']}
+
+📍 Distance: {{distance}}
 
 To claim: Reply "CLAIM {listing_data['listing_id']}"
 
 ID: {listing_data['listing_id']}"""
     
-    # Send to each NGO
+    print(f"📝 [SMS_BROADCAST] Base message template created ({len(base_message)} chars)")
+    
+    # Send to each NGO with personalized information
     results = []
-    for ngo in matched_ngos:
+    for i, ngo in enumerate(all_ngos, 1):
         try:
-            # Customize message with NGO-specific distance
-            personalized_message = message.replace('{distance}', f"{ngo['distance_km']} km away")
+            print(f"📱 [SMS_BROADCAST] Processing NGO {i}/{len(all_ngos)}: {ngo['name']}")
+            print(f"📱 [SMS_BROADCAST] NGO details: Phone={ngo['phone']}, Address={ngo.get('address', 'N/A')}")
             
+            # Customize message with NGO-specific distance and location info
+            if ngo['distance_km'] is not None:
+                distance_text = f"{ngo['distance_km']} km from you"
+                print(f"📏 [SMS_BROADCAST] Distance to {ngo['name']}: {ngo['distance_km']} km")
+            else:
+                distance_text = "Distance unknown (enable location)"
+                print(f"📏 [SMS_BROADCAST] Distance to {ngo['name']}: Cannot calculate")
+            
+            # Personalize the message
+            personalized_message = base_message.replace('{distance}', distance_text)
+            
+            print(f"📝 [SMS_BROADCAST] Message for {ngo['name']}: {len(personalized_message)} chars")
+            print(f"📞 [SMS_BROADCAST] Sending SMS to {ngo['phone']}...")
+            
+            # Send SMS
             result = await send_sms_notification(ngo['phone'], personalized_message)
+            result['ngo_name'] = ngo['name']  # Add NGO name for logging
+            result['ngo_id'] = ngo['id']      # Add NGO ID for logging
             results.append(result)
             
-            # Log the notification
-            db.log_event("notification", listing_data['listing_id'], "sms_sent", {
+            print(f"📤 [SMS_BROADCAST] SMS to {ngo['name']}: {result['status']}")
+            
+            # Log individual notification
+            db.log_event("notification", listing_data['listing_id'], "sms_sent_to_ngo", {
                 "ngo_id": ngo['id'],
+                "ngo_name": ngo['name'],
                 "ngo_phone": ngo['phone'],
-                "status": result['status']
+                "status": result['status'],
+                "distance_km": ngo['distance_km'],
+                "message_length": len(personalized_message)
             })
             
+            # Small delay to avoid rate limiting
+            await asyncio.sleep(0.1)  # 100ms delay between SMS
+            
         except Exception as e:
-            print(f"❌ [SMS] Failed to notify {ngo['name']} at {ngo['phone']}: {e}")
-            results.append({
+            print(f"❌ [SMS_BROADCAST] Failed to notify {ngo['name']} at {ngo['phone']}: {e}")
+            error_result = {
                 "status": "error",
                 "phone": ngo['phone'],
-                "message": str(e)
+                "message": str(e),
+                "ngo_name": ngo['name'],
+                "ngo_id": ngo['id']
+            }
+            results.append(error_result)
+            
+            # Log error
+            db.log_event("notification", listing_data['listing_id'], "sms_error", {
+                "ngo_id": ngo['id'],
+                "ngo_phone": ngo['phone'],
+                "error": str(e)
             })
     
+    # Summary statistics
     successful_sends = sum(1 for r in results if r['status'] == 'sent')
-    print(f"📱 [SMS] Sent {successful_sends}/{len(matched_ngos)} notifications successfully")
+    failed_sends = len(results) - successful_sends
+    
+    print(f"📊 [SMS_BROADCAST] BROADCAST COMPLETE!")
+    print(f"📊 [SMS_BROADCAST] Total NGOs: {len(all_ngos)}")
+    print(f"📊 [SMS_BROADCAST] Successful: {successful_sends}")
+    print(f"📊 [SMS_BROADCAST] Failed: {failed_sends}")
+    print(f"📊 [SMS_BROADCAST] Success Rate: {(successful_sends/len(all_ngos)*100):.1f}%")
+    
+    # Log final summary
+    db.log_event("listing", listing_data['listing_id'], "sms_broadcast_completed", {
+        "total_ngos": len(all_ngos),
+        "successful_sends": successful_sends,
+        "failed_sends": failed_sends,
+        "success_rate": round(successful_sends/len(all_ngos)*100, 1) if all_ngos else 0
+    })
     
     return results
 
@@ -781,56 +850,104 @@ async def create_smart_listing(
         "food_category": food_category
     })
     
-    # Enhanced auto-matching with SMS notifications
-    matched_ngos = []
+    # Enhanced SMS notifications to ALL NGOs
+    all_ngos = []
     sms_results = []
     successful_notifications = 0
     
     if auto_match:
-        print(f"🔍 [MATCHING] Finding nearby NGOs for listing {listing_id}")
-        matched_ngos = await _find_matching_ngos(listing_id)
-        print(f"🔍 [MATCHING] Found {len(matched_ngos)} NGOs for listing {listing_id}")
-        if matched_ngos:
-            print(f"📱 [SMS] Found {len(matched_ngos)} nearby NGOs, sending notifications...")
+        print(f"🔍 [SMS_BROADCAST] Getting ALL NGOs for listing {listing_id}")
+        print(f"📊 [SMS_BROADCAST] Auto-match enabled, will notify all registered NGOs")
+        
+        # Get ALL NGOs (no distance filtering)
+        with db.get_connection() as conn:
+            cursor = conn.execute('''
+                SELECT n.id, n.name, n.phone, n.address, n.geo_lat, n.geo_lng, 
+                       n.daily_meal_capacity, n.beneficiary_count, n.focus_areas
+                FROM ngos n
+                JOIN user_permissions p ON n.phone = p.phone
+                WHERE p.role = ? AND n.phone IS NOT NULL AND n.phone != ''
+            ''', (NGO_ROLE,))
+            all_ngos = [dict(row) for row in cursor.fetchall()]
+        
+        print(f"📋 [SMS_BROADCAST] Found {len(all_ngos)} total NGOs in database")
+        
+        if all_ngos:
+            print(f"📱 [SMS_BROADCAST] Preparing to send SMS to all {len(all_ngos)} NGOs...")
             
-            # Prepare listing data for SMS notifications
+            # Calculate distances and prepare comprehensive listing data
+            restaurant_coords = None
+            with db.get_connection() as conn:
+                cursor = conn.execute('SELECT geo_lat, geo_lng FROM restaurants WHERE id = ?', (restaurant['id'],))
+                coords = cursor.fetchone()
+                if coords and coords['geo_lat'] and coords['geo_lng']:
+                    restaurant_coords = (coords['geo_lat'], coords['geo_lng'])
+                    print(f"📍 [SMS_BROADCAST] Restaurant coordinates: {restaurant_coords}")
+                else:
+                    print(f"⚠️ [SMS_BROADCAST] Restaurant coordinates not available")
+            
+            # Add distance information to each NGO
+            for i, ngo in enumerate(all_ngos):
+                print(f"🏛️ [SMS_BROADCAST] Processing NGO {i+1}/{len(all_ngos)}: {ngo['name']} ({ngo['phone']})")
+                
+                # Calculate distance if both coordinates exist
+                if restaurant_coords and ngo['geo_lat'] and ngo['geo_lng']:
+                    distance = calculate_distance(
+                        restaurant_coords[0], restaurant_coords[1],
+                        ngo['geo_lat'], ngo['geo_lng']
+                    )
+                    ngo['distance_km'] = round(distance, 2)
+                    print(f"📏 [SMS_BROADCAST] Distance to {ngo['name']}: {ngo['distance_km']} km")
+                else:
+                    ngo['distance_km'] = None
+                    print(f"📏 [SMS_BROADCAST] Distance to {ngo['name']}: Cannot calculate (missing coordinates)")
+            
+            # Prepare comprehensive listing data for SMS
             listing_data = {
                 "listing_id": listing_id,
                 "restaurant_name": restaurant['name'],
+                "restaurant_address": restaurant['address'] or "Address not available",
                 "description": description,
                 "quantity": quantity,
                 "unit": unit,
                 "pickup_window": f"{pickup_start.strftime('%H:%M')}-{pickup_end.strftime('%H:%M')}",
-                "restaurant_address": restaurant['address'] or "Address not available",
                 "expires_at": expires_at.strftime('%H:%M'),
                 "food_category": food_category,
                 "dietary_info": dietary_info
             }
             
-            # Send SMS notifications to nearby NGOs
+            print(f"📝 [SMS_BROADCAST] Listing data prepared: {listing_data}")
+            
+            # Send SMS notifications to ALL NGOs
             try:
-                sms_results = await notify_nearby_ngos_via_sms(listing_data, matched_ngos)
+                print(f"🚀 [SMS_BROADCAST] Starting SMS broadcast to {len(all_ngos)} NGOs...")
+                sms_results = await notify_all_ngos_via_sms(listing_data, all_ngos)
                 successful_notifications = sum(1 for r in sms_results if r.get('status') == 'sent')
+                
+                print(f"📊 [SMS_BROADCAST] SMS Results: {successful_notifications}/{len(all_ngos)} successful")
                 
                 # Log successful notifications
                 if successful_notifications > 0:
-                    db.log_event("listing", listing_id, "sms_notifications_sent", {
-                        "total_ngos": len(matched_ngos),
+                    db.log_event("listing", listing_id, "sms_broadcast_sent", {
+                        "total_ngos": len(all_ngos),
                         "successful_sends": successful_notifications,
                         "failed_sends": len(sms_results) - successful_notifications
                     })
+                    print(f"✅ [SMS_BROADCAST] Logged successful broadcast: {successful_notifications} sent")
                 
             except Exception as e:
-                print(f"❌ [SMS] Error sending notifications: {e}")
+                print(f"❌ [SMS_BROADCAST] Critical error during SMS broadcast: {e}")
                 # Still continue, just log the error
-                db.log_event("listing", listing_id, "sms_notification_error", {
+                db.log_event("listing", listing_id, "sms_broadcast_error", {
                     "error": str(e),
-                    "matched_ngos_count": len(matched_ngos)
+                    "total_ngos_count": len(all_ngos)
                 })
         else:
-            print(f"📭 [MATCHING] No nearby NGOs found for listing {listing_id}")
+            print(f"📭 [SMS_BROADCAST] No NGOs found in database!")
+    else:
+        print(f"🔇 [SMS_BROADCAST] Auto-match disabled, skipping SMS notifications")
     
-    match_count = len(matched_ngos)
+    ngo_count = len(all_ngos)
     
     # Build detailed response
     result_message = f"✅ **Smart Listing Created Successfully!**\n\n"
@@ -850,23 +967,32 @@ async def create_smart_listing(
     result_message += f"🤖 **Auto-Match**: {'✅ ON' if auto_match else '❌ OFF'}\n"
     
     if auto_match:
-        result_message += f"🎯 **Nearby NGOs Found**: {match_count}\n"
+        result_message += f"🏛️ **Total NGOs in System**: {ngo_count}\n"
         
-        if match_count > 0:
-            result_message += f"📱 **SMS Notifications**: {successful_notifications}/{match_count} sent\n"
+        if ngo_count > 0:
+            result_message += f"📱 **SMS Broadcast**: {successful_notifications}/{ngo_count} sent\n"
             
-            # Show which NGOs were notified
+            # Show sample of notified NGOs (first 5)
             if successful_notifications > 0:
-                result_message += f"\n📋 **Notified NGOs**:\n"
-                for i, (ngo, sms_result) in enumerate(zip(matched_ngos, sms_results), 1):
-                    status_emoji = "✅" if sms_result.get('status') == 'sent' else "❌"
-                    result_message += f"{i}. {status_emoji} {ngo['name']} ({ngo['distance_km']}km)\n"
+                result_message += f"\n📋 **Sample Notified NGOs**:\n"
+                successful_ngos = []
+                for ngo, sms_result in zip(all_ngos, sms_results):
+                    if sms_result.get('status') == 'sent':
+                        successful_ngos.append(ngo)
+                
+                # Show first 5 successful notifications
+                for i, ngo in enumerate(successful_ngos[:5], 1):
+                    distance_info = f"{ngo['distance_km']}km" if ngo['distance_km'] else "Distance unknown"
+                    result_message += f"{i}. ✅ {ngo['name']} ({distance_info})\n"
+                
+                if len(successful_ngos) > 5:
+                    result_message += f"... and {len(successful_ngos) - 5} more NGOs\n"
             
-            if successful_notifications < match_count:
-                failed_count = match_count - successful_notifications
+            if successful_notifications < ngo_count:
+                failed_count = ngo_count - successful_notifications
                 result_message += f"\n⚠️ **Failed SMS**: {failed_count} notifications failed to send\n"
         else:
-            result_message += f"📭 **No nearby NGOs found** (within 15km radius)\n"
+            result_message += f"📭 **No NGOs found** in the system\n"
     else:
         result_message += f"📢 **Manual Mode**: NGOs must discover this listing themselves\n"
     
@@ -876,7 +1002,7 @@ async def create_smart_listing(
     # Add helpful tips
     if auto_match and successful_notifications > 0:
         result_message += f"\n\n💡 **Next Steps**: NGOs can claim by replying 'CLAIM {listing_id}' to SMS or using the claim tool"
-    elif auto_match and match_count == 0:
+    elif auto_match  == 0:
         result_message += f"\n\n💡 **Tip**: Try expanding your pickup window or check if your restaurant location is set correctly"
     
     return result_message
@@ -1575,6 +1701,226 @@ async def get_available_listings(
                   f"🆔 ID: {listing['id']}\n\n"
     
     return result
+
+
+# --- Gamification Leaderboard ---
+@mcp.tool
+async def get_donation_leaderboard(
+    period: Annotated[str, Field(description="Time period (week/month/all)", default="month")]
+) -> str:
+    """Get leaderboard of top donating restaurants"""
+    
+    # Determine date filter
+    if period == "week":
+        date_filter = "date(l.created_at) >= date('now', '-7 days')"
+        period_title = "Weekly"
+    elif period == "month":
+        date_filter = "date(l.created_at) >= date('now', '-30 days')"
+        period_title = "Monthly"
+    else:
+        date_filter = "1=1"
+        period_title = "All-Time"
+    
+    with db.get_connection() as conn:
+        # Get top restaurants by completed donations
+        cursor = conn.execute(f'''
+            SELECT 
+                r.name,
+                r.address,
+                COUNT(DISTINCT l.id) as total_listings,
+                SUM(l.estimated_servings) as total_meals,
+                r.avg_waste_percentage,
+                r.total_donations
+            FROM restaurants r
+            JOIN listings l ON r.id = l.restaurant_id
+            JOIN claims c ON l.id = c.listing_id
+            WHERE l.status = 'DELIVERED'
+            AND c.status = 'DELIVERED'
+            AND {date_filter}
+            GROUP BY r.id
+            ORDER BY total_meals DESC
+            LIMIT 10
+        ''')
+        
+        leaders = cursor.fetchall()
+        
+        # Get platform totals
+        cursor = conn.execute(f'''
+            SELECT 
+                COUNT(DISTINCT r.id) as total_restaurants,
+                SUM(l.estimated_servings) as total_meals
+            FROM restaurants r
+            JOIN listings l ON r.id = l.restaurant_id
+            JOIN claims c ON l.id = c.listing_id
+            WHERE l.status = 'DELIVERED'
+            AND c.status = 'DELIVERED'
+            AND {date_filter}
+        ''')
+        totals = cursor.fetchone()
+    
+    if not leaders:
+        return f"🏆 **Food Rescue Leaderboard**\n\n" \
+               f"📅 Period: {period_title}\n\n" \
+               f"📭 No donation data available for this period"
+    
+    # Calculate environmental impact
+    total_co2_saved = totals['total_meals'] * 2.5 if totals['total_meals'] else 0
+    total_food_saved = totals['total_meals'] * 0.4 if totals['total_meals'] else 0
+    
+    result = f"🏆 **Food Rescue Leaderboard**\n\n" \
+             f"📅 Period: {period_title}\n" \
+             f"🍽️ Total Restaurants: {totals['total_restaurants'] or 0}\n" \
+             f"📦 Total Meals Saved: {totals['total_meals'] or 0}\n" \
+             f"🌱 Environmental Impact:\n" \
+             f"- CO₂ Reduced: ~{total_co2_saved:.1f} kg\n" \
+             f"- Food Rescued: ~{total_food_saved:.1f} kg\n\n" \
+             f"🏅 **Top Restaurants**:\n\n"
+    
+    for i, restaurant in enumerate(leaders, 1):
+        # Calculate stars based on performance (1-5 stars)
+        stars = min(5, max(1, int(restaurant['total_meals'] / 100)))
+        
+        result += f"{i}. ⭐{'★' * stars}{'☆' * (5 - stars)} **{restaurant['name']}**\n" \
+                  f"   📍 {restaurant['address']}\n" \
+                  f"   � Meals Donated: {restaurant['total_meals']}\n" \
+                  f"   📊 Listings: {restaurant['total_listings']}\n" \
+                  f"   ♻️ Waste Reduction: {restaurant['avg_waste_percentage']}% → ~5%\n\n"
+    
+    # Add motivational message
+    if period == "week":
+        result += "💪 Keep up the great work this week!"
+    elif period == "month":
+        result += "🌱 Your monthly impact is making a real difference!"
+    else:
+        result += "🏅 Legendary status! Thank you for your ongoing commitment."
+    
+    db.log_event("gamification", "leaderboard", "viewed", {
+        "period": period,
+        "top_restaurant": leaders[0]['name'] if leaders else None
+    })
+    
+    return result
+
+# --- Help Command ---
+@mcp.tool
+async def food_waste_matchmakers(
+    command: Annotated[Optional[str], Field(description="Specific command to get help for", default=None)]
+) -> str:
+    """Get help about all available commands or specific command details"""
+    
+    commands = {
+        "register_restaurant": {
+            "description": "Register a new restaurant",
+            "usage": "/register_restaurant name='Taj Hotel' phone='+912266778899' address='Mumbai' cuisine_types=['Indian','Continental'] capacity_per_day=200",
+            "example": "Register a restaurant called 'Taj Hotel' that can donate 200 meals per day"
+        },
+        "register_ngo": {
+            "description": "Register a new NGO",
+            "usage": "/register_ngo name='Feeding India' phone='+919988776655' address='Andheri' beneficiary_count=500 meal_capacity_per_day=1000",
+            "example": "Register an NGO called 'Feeding India' that serves 500 people daily"
+        },
+        "register_driver": {
+            "description": "Register a new driver",
+            "usage": "/register_driver name='Rahul Sharma' phone='+919876543210' vehicle_type='bike' license_number='MH0120192837465'",
+            "example": "Register a bike driver named Rahul Sharma"
+        },
+        "create_smart_listing": {
+            "description": "Create a food listing with auto-matching",
+            "usage": "/create_smart_listing restaurant_phone='+912266778899' description='Fresh vegetarian meals' quantity=50 unit='meals' pickup_hours=2",
+            "example": "List 50 vegetarian meals available for pickup in 2 hours"
+        },
+        "claim_listing": {
+            "description": "Claim an available food listing",
+            "usage": "/claim_listing ngo_phone='+919988776655' listing_id='abc123' estimated_pickup_time='14:30'",
+            "example": "Claim listing ABC123 for pickup at 2:30 PM"
+        },
+        "assign_driver": {
+            "description": "Assign a driver to a claimed listing",
+            "usage": "/assign_driver requester_phone='+919876543210' claim_id='def456' driver_phone='+919988776655'",
+            "example": "Assign driver to claim DEF456"
+        },
+        "update_claim_status": {
+            "description": "Update the status of a food claim",
+            "usage": "/update_claim_status updated_by_phone='+919876543210' claim_id='def456' new_status='PICKED'",
+            "example": "Mark claim DEF456 as picked up"
+        },
+        "get_available_listings": {
+            "description": "View available food listings",
+            "usage": "/get_available_listings max_distance_km=10 food_category='meals'",
+            "example": "Find available meals within 10km"
+        },
+        "get_donation_leaderboard": {
+            "description": "View top donating restaurants",
+            "usage": "/get_donation_leaderboard period='month' metric='total_donations' limit=10",
+            "example": "See monthly donation leaderboard ranked by total donations"
+        },
+        "get_restaurant_leaderboard": {
+            "description": "View restaurant leaderboard with gamification",
+            "usage": "/get_restaurant_leaderboard period='month' metric='impact_score' limit=5",
+            "example": "See top 5 restaurants by impact score this month"
+        },
+        "help": {
+            "description": "Get help about commands",
+            "usage": "/help command='create_smart_listing'",
+            "example": "Get detailed help about creating listings"
+        }
+    }
+    
+    # If specific command requested and it exists
+    if command and command in commands:
+        cmd = commands[command]
+        return (f"🆘 **Detailed Help for `/{command}`**\n\n"
+                f"📝 **Description**: {cmd['description']}\n\n"
+                f"💻 **Usage**:\n`{cmd['usage']}`\n\n"
+                f"📌 **Example**:\n{cmd['example']}\n\n"
+                f"🔍 Try it out or type just `/help` for all commands")
+    
+    # General help - show all commands
+    help_text = ("🆘 **Food Waste Matchmaker Help**\n\n"
+                "Here are all available commands:\n\n")
+    
+    # Group commands by category
+    categories = {
+        "Registration": [
+            "register_restaurant",
+            "register_ngo",
+            "register_driver"
+        ],
+        "Food Listings": [
+            "create_smart_listing",
+            "get_available_listings"
+        ],
+        "Claim Management": [
+            "claim_listing",
+            "assign_driver",
+            "update_claim_status"
+        ],
+        "Analytics & Gamification": [
+            "get_donation_leaderboard",
+            "get_restaurant_leaderboard"
+        ],
+        "System": [
+            "help"
+        ]
+    }
+    
+    for category, cmd_list in categories.items():
+        help_text += f"**{category}**\n"
+        for cmd in cmd_list:
+            help_text += f"• `/{cmd}`: {commands[cmd]['description']}\n"
+        help_text += "\n"
+    
+    help_text += ("\nℹ️ **Usage Tips**:\n"
+                 "- Type `/help command='command_name'` for detailed help about a specific command\n"
+                 "- Parameters with spaces should be wrapped in quotes like `name='Taj Hotel'`\n"
+                 "- List parameters use square brackets like `cuisine_types=['Indian','Chinese']`\n\n"
+                 "💡 **Quick Start**:\n"
+                 "1. Restaurants: Use `/create_smart_listing` to donate food\n"
+                 "2. NGOs: Use `/get_available_listings` to find food\n"
+                 "3. Drivers: Wait for assignment notifications\n"
+                 "4. Check `/get_restaurant_leaderboard` to see who's making the biggest impact!")
+    
+    return help_text
 
 # --- Utility Functions ---
 def calculate_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
