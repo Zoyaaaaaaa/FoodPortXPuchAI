@@ -1918,6 +1918,445 @@ async def food_waste_matchmakers(
     
     return help_text
 
+
+# Add these imports at the top
+from typing import Optional, Literal
+from datetime import datetime, timedelta
+
+# --- Restaurant and NGO Listing Tools ---
+
+@mcp.tool
+async def get_all_restaurants(
+    active_only: Annotated[bool, Field(description="Show only restaurants with recent activity", default=True)],
+    limit: Annotated[int, Field(description="Maximum number to return", default=20)]
+) -> str:
+    """Get list of all registered restaurants with their details"""
+    
+    with db.get_connection() as conn:
+        if active_only:
+            query = '''
+                SELECT r.*, 
+                       COUNT(l.id) as listing_count,
+                       MAX(l.created_at) as last_listing_date
+                FROM restaurants r
+                LEFT JOIN listings l ON r.id = l.restaurant_id
+                GROUP BY r.id
+                HAVING listing_count > 0
+                ORDER BY last_listing_date DESC
+                LIMIT ?
+            '''
+        else:
+            query = '''
+                SELECT r.*
+                FROM restaurants r
+                ORDER BY r.created_at DESC
+                LIMIT ?
+            '''
+        
+        cursor = conn.execute(query, (limit,))
+        restaurants = cursor.fetchall()
+    
+    if not restaurants:
+        return "📭 No restaurants found" + (" with recent activity" if active_only else "")
+    
+    result = f"🍽️ **Restaurants List** ({len(restaurants)} shown)\n\n"
+    
+    for i, restaurant in enumerate(restaurants, 1):
+        cuisines = json.loads(restaurant['cuisine_types'] or '[]')
+        result += f"{i}. **{restaurant['name']}**\n"
+        result += f"   📱 {restaurant['phone']}\n"
+        result += f"   📍 {restaurant['address']}\n"
+        result += f"   🍲 Cuisines: {', '.join(cuisines) or 'Not specified'}\n"
+        result += f"   🏷 Capacity: {restaurant['daily_capacity']} meals/day\n"
+        if 'listing_count' in restaurant and restaurant['listing_count']:
+            result += f"   📊 Listings: {restaurant['listing_count']} (last: {restaurant['last_listing_date'][:10]})\n"
+        result += "\n"
+    
+    return result
+
+@mcp.tool
+async def get_all_ngos(
+    active_only: Annotated[bool, Field(description="Show only NGOs with recent claims", default=True)],
+    limit: Annotated[int, Field(description="Maximum number to return", default=20)]
+) -> str:
+    """Get list of all registered NGOs with their details"""
+    
+    with db.get_connection() as conn:
+        if active_only:
+            query = '''
+                SELECT n.*, 
+                       COUNT(c.id) as claim_count,
+                       MAX(c.requested_at) as last_claim_date
+                FROM ngos n
+                LEFT JOIN claims c ON n.id = c.ngo_id
+                GROUP BY n.id
+                HAVING claim_count > 0
+                ORDER BY last_claim_date DESC
+                LIMIT ?
+            '''
+        else:
+            query = '''
+                SELECT n.*
+                FROM ngos n
+                ORDER BY n.created_at DESC
+                LIMIT ?
+            '''
+        
+        cursor = conn.execute(query, (limit,))
+        ngos = cursor.fetchall()
+    
+    if not ngos:
+        return "📭 No NGOs found" + (" with recent activity" if active_only else "")
+    
+    result = f"🏛 **NGOs List** ({len(ngos)} shown)\n\n"
+    
+    for i, ngo in enumerate(ngos, 1):
+        focus_areas = json.loads(ngo['focus_areas'] or '[]')
+        result += f"{i}. **{ngo['name']}**\n"
+        result += f"   📱 {ngo['phone']}\n"
+        result += f"   📍 {ngo['address']}\n"
+        result += f"   🎯 Focus: {', '.join(focus_areas) or 'General'}\n"
+        result += f"   👥 Beneficiaries: {ngo['beneficiary_count']}\n"
+        result += f"   🍽 Capacity: {ngo['daily_meal_capacity']} meals/day\n"
+        if 'claim_count' in ngo and ngo['claim_count']:
+            result += f"   📊 Claims: {ngo['claim_count']} (last: {ngo['last_claim_date'][:10]})\n"
+        result += "\n"
+    
+    return result
+
+# --- Analytics Tools ---
+
+@mcp.tool
+async def get_platform_analytics(
+    period: Annotated[Literal["day", "week", "month", "quarter", "year", "all_time"], 
+                Field(description="Time period for analytics", default="month")]
+) -> str:
+    """Get comprehensive platform analytics report"""
+    
+    # Determine date range
+    now = datetime.now()
+    if period == "day":
+        date_filter = "DATE(created_at) = DATE('now')"
+        period_title = "Today"
+    elif period == "week":
+        date_filter = "DATE(created_at) >= DATE('now', '-7 days')"
+        period_title = "This Week"
+    elif period == "month":
+        date_filter = "DATE(created_at) >= DATE('now', '-30 days')"
+        period_title = "This Month"
+    elif period == "quarter":
+        date_filter = "DATE(created_at) >= DATE('now', '-90 days')"
+        period_title = "This Quarter"
+    elif period == "year":
+        date_filter = "DATE(created_at) >= DATE('now', '-365 days')"
+        period_title = "This Year"
+    else:  # all_time
+        date_filter = "1=1"
+        period_title = "All Time"
+    
+    with db.get_connection() as conn:
+        # Core metrics
+        cursor = conn.execute(f'''
+            SELECT 
+                COUNT(DISTINCT l.id) as total_listings,
+                COUNT(DISTINCT CASE WHEN l.status = 'DELIVERED' THEN l.id END) as delivered_listings,
+                COUNT(DISTINCT l.restaurant_id) as active_restaurants,
+                COUNT(DISTINCT c.ngo_id) as active_ngos,
+                COUNT(DISTINCT c.driver_id) as active_drivers,
+                SUM(CASE WHEN l.status = 'DELIVERED' THEN l.estimated_servings ELSE 0 END) as meals_saved,
+                AVG((julianday(c.delivered_at) - julianday(c.requested_at)) * 24 as avg_hours_to_delivery
+            FROM listings l
+            LEFT JOIN claims c ON l.id = c.listing_id
+            WHERE {date_filter.replace('created_at', 'l.created_at')}
+            AND (c.id IS NULL OR c.status = 'DELIVERED')
+        ''')
+        metrics = cursor.fetchone()
+        
+        # Growth metrics
+        cursor = conn.execute(f'''
+            SELECT 
+                COUNT(DISTINCT r.id) as new_restaurants,
+                COUNT(DISTINCT n.id) as new_ngos,
+                COUNT(DISTINCT d.id) as new_drivers
+            FROM (
+                SELECT id FROM restaurants WHERE {date_filter.replace('created_at', 'created_at')}
+                UNION
+                SELECT id FROM ngos WHERE {date_filter.replace('created_at', 'created_at')}
+                UNION
+                SELECT id FROM drivers WHERE {date_filter.replace('created_at', 'created_at')}
+            )
+        ''')
+        growth = cursor.fetchone()
+        
+        # Top performers
+        cursor = conn.execute(f'''
+            SELECT 
+                r.name as restaurant_name,
+                COUNT(DISTINCT l.id) as listings,
+                SUM(l.estimated_servings) as meals
+            FROM restaurants r
+            JOIN listings l ON r.id = l.restaurant_id
+            WHERE {date_filter.replace('created_at', 'l.created_at')}
+            GROUP BY r.id
+            ORDER BY meals DESC
+            LIMIT 3
+        ''')
+        top_restaurants = [dict(row) for row in cursor.fetchall()]
+        
+        cursor = conn.execute(f'''
+            SELECT 
+                n.name as ngo_name,
+                COUNT(DISTINCT c.id) as claims,
+                SUM(l.estimated_servings) as meals
+            FROM ngos n
+            JOIN claims c ON n.id = c.ngo_id
+            JOIN listings l ON c.listing_id = l.id
+            WHERE {date_filter.replace('created_at', 'c.requested_at')}
+            AND c.status = 'DELIVERED'
+            GROUP BY n.id
+            ORDER BY meals DESC
+            LIMIT 3
+        ''')
+        top_ngos = [dict(row) for row in cursor.fetchall()]
+        
+        cursor = conn.execute(f'''
+            SELECT 
+                d.name as driver_name,
+                COUNT(DISTINCT c.id) as deliveries,
+                SUM(l.estimated_servings) as meals,
+                AVG(c.distance_km) as avg_distance
+            FROM drivers d
+            JOIN claims c ON d.id = c.driver_id
+            JOIN listings l ON c.listing_id = l.id
+            WHERE {date_filter.replace('created_at', 'c.requested_at')}
+            AND c.status = 'DELIVERED'
+            GROUP BY d.id
+            ORDER BY deliveries DESC
+            LIMIT 3
+        ''')
+        top_drivers = [dict(row) for row in cursor.fetchall()]
+    
+    # Calculate impact metrics
+    co2_saved = (metrics['meals_saved'] or 0) * 2.5  # ~2.5kg CO2 per meal
+    food_rescued = (metrics['meals_saved'] or 0) * 0.4  # ~0.4kg food per meal
+    success_rate = (metrics['delivered_listings'] / metrics['total_listings'] * 100) if metrics['total_listings'] > 0 else 0
+    
+    report = f"📊 **Platform Analytics Report**\n\n"
+    report += f"📅 Period: {period_title}\n"
+    report += f"⏱ Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+    
+    # Core metrics
+    report += f"📈 **Core Metrics**\n"
+    report += f"- 🍽 Listings Created: {metrics['total_listings'] or 0}\n"
+    report += f"- ✅ Successful Deliveries: {metrics['delivered_listings'] or 0}\n"
+    report += f"- 🎯 Success Rate: {success_rate:.1f}%\n"
+    report += f"- ⏱ Avg Delivery Time: {metrics['avg_hours_to_delivery'] or 0:.1f} hours\n"
+    report += f"- 👥 Active Participants:\n"
+    report += f"  - 🏢 Restaurants: {metrics['active_restaurants'] or 0}\n"
+    report += f"  - 🏛 NGOs: {metrics['active_ngos'] or 0}\n"
+    report += f"  - 🚛 Drivers: {metrics['active_drivers'] or 0}\n\n"
+    
+    # Growth metrics
+    report += f"🌱 **Growth Metrics**\n"
+    report += f"- 🆕 New Restaurants: {growth['new_restaurants'] or 0}\n"
+    report += f"- 🆕 New NGOs: {growth['new_ngos'] or 0}\n"
+    report += f"- 🆕 New Drivers: {growth['new_drivers'] or 0}\n\n"
+    
+    # Impact metrics
+    report += f"🌍 **Environmental Impact**\n"
+    report += f"- 🍲 Meals Saved: {metrics['meals_saved'] or 0}\n"
+    report += f"- 🌱 CO₂ Reduced: ~{co2_saved:.1f} kg\n"
+    report += f"- ♻ Food Rescued: ~{food_rescued:.1f} kg\n\n"
+    
+    # Top performers
+    report += f"🏆 **Top Performers**\n"
+    
+    report += f"🍽 **Top Restaurants**\n"
+    for i, r in enumerate(top_restaurants, 1):
+        report += f"{i}. {r['restaurant_name']}: {r['meals']} meals ({r['listings']} listings)\n"
+    
+    report += f"\n🏛 **Top NGOs**\n"
+    for i, n in enumerate(top_ngos, 1):
+        report += f"{i}. {n['ngo_name']}: {n['meals']} meals ({n['claims']} claims)\n"
+    
+    report += f"\n🚛 **Top Drivers**\n"
+    for i, d in enumerate(top_drivers, 1):
+        report += f"{i}. {d['driver_name']}: {d['deliveries']} deliveries ({d['meals']} meals, avg {d['avg_distance']:.1f} km)\n"
+    
+    # Recommendations
+    report += f"\n💡 **Recommendations**\n"
+    if success_rate < 70:
+        report += "- Focus on improving claim success rates through better matching\n"
+    if metrics['avg_hours_to_delivery'] > 4:
+        report += "- Optimize logistics to reduce delivery times\n"
+    if growth['new_restaurants'] < 5:
+        report += "- Increase restaurant onboarding efforts\n"
+    
+    db.log_event("analytics", "platform", "report_generated", {
+        "period": period_title,
+        "meals_saved": metrics['meals_saved'] or 0
+    })
+    
+    return report
+
+@mcp.tool
+async def get_ngo_analytics(
+    ngo_phone: Annotated[str, Field(description="NGO phone number")],
+    period: Annotated[Literal["week", "month", "quarter", "year", "all_time"], 
+                Field(description="Time period for analytics", default="month")]
+) -> str:
+    """Get detailed analytics report for a specific NGO"""
+    
+    # Determine date range
+    if period == "week":
+        date_filter = "DATE(requested_at) >= DATE('now', '-7 days')"
+        period_title = "This Week"
+    elif period == "month":
+        date_filter = "DATE(requested_at) >= DATE('now', '-30 days')"
+        period_title = "This Month"
+    elif period == "quarter":
+        date_filter = "DATE(requested_at) >= DATE('now', '-90 days')"
+        period_title = "This Quarter"
+    elif period == "year":
+        date_filter = "DATE(requested_at) >= DATE('now', '-365 days')"
+        period_title = "This Year"
+    else:  # all_time
+        date_filter = "1=1"
+        period_title = "All Time"
+    
+    with db.get_connection() as conn:
+        # Get NGO ID
+        cursor = conn.execute('''
+            SELECT n.id, n.name FROM ngos n 
+            JOIN user_permissions p ON n.phone = p.phone
+            WHERE n.phone = ? AND p.role = ?
+        ''', (ngo_phone, NGO_ROLE))
+        ngo = cursor.fetchone()
+        
+        if not ngo:
+            raise McpError(ErrorData(
+                code=INVALID_PARAMS,
+                message="NGO not found or not registered"
+            ))
+        
+        # Activity metrics
+        cursor = conn.execute(f'''
+            SELECT 
+                COUNT(DISTINCT c.id) as total_claims,
+                COUNT(DISTINCT CASE WHEN c.status = 'DELIVERED' THEN c.id END) as successful_claims,
+                SUM(l.estimated_servings) as meals_received,
+                AVG((julianday(c.delivered_at) - julianday(c.requested_at)) * 24 as avg_hours_to_delivery,
+                AVG(c.distance_km) as avg_distance_km,
+                COUNT(DISTINCT c.driver_id) as drivers_used,
+                COUNT(DISTINCT l.restaurant_id) as restaurants_worked_with
+            FROM claims c
+            JOIN listings l ON c.listing_id = l.id
+            WHERE c.ngo_id = ?
+            AND {date_filter}
+        ''', (ngo['id'],))
+        activity = cursor.fetchone()
+        
+        # Recent claims
+        cursor = conn.execute(f'''
+            SELECT 
+                c.id as claim_id,
+                l.description,
+                l.quantity,
+                l.unit,
+                r.name as restaurant_name,
+                c.status,
+                c.requested_at,
+                c.delivered_at
+            FROM claims c
+            JOIN listings l ON c.listing_id = l.id
+            JOIN restaurants r ON l.restaurant_id = r.id
+            WHERE c.ngo_id = ?
+            AND {date_filter}
+            ORDER BY c.requested_at DESC
+            LIMIT 5
+        ''', (ngo['id'],))
+        recent_claims = [dict(row) for row in cursor.fetchall()]
+        
+        # Top restaurants
+        cursor = conn.execute(f'''
+            SELECT 
+                r.name as restaurant_name,
+                COUNT(DISTINCT c.id) as claims,
+                SUM(l.estimated_servings) as meals
+            FROM claims c
+            JOIN listings l ON c.listing_id = l.id
+            JOIN restaurants r ON l.restaurant_id = r.id
+            WHERE c.ngo_id = ?
+            AND {date_filter}
+            GROUP BY r.id
+            ORDER BY meals DESC
+            LIMIT 3
+        ''', (ngo['id'],))
+        top_restaurants = [dict(row) for row in cursor.fetchall()]
+        
+        # Get NGO details
+        cursor = conn.execute('''
+            SELECT * FROM ngos WHERE id = ?
+        ''', (ngo['id'],))
+        ngo_details = cursor.fetchone()
+    
+    # Calculate metrics
+    success_rate = (activity['successful_claims'] / activity['total_claims'] * 100) if activity['total_claims'] > 0 else 0
+    utilization_rate = (activity['meals_received'] / (ngo_details['daily_meal_capacity'] * 30)) * 100 if ngo_details['daily_meal_capacity'] > 0 else 0
+    
+    report = f"🏛 **NGO Analytics Report**\n\n"
+    report += f"📅 Period: {period_title}\n"
+    report += f"⏱ Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+    
+    # NGO details
+    report += f"🏛 **{ngo_details['name']}**\n"
+    report += f"📱 {ngo_details['phone']} | 📍 {ngo_details['address']}\n"
+    report += f"👥 Beneficiaries: {ngo_details['beneficiary_count']}\n"
+    report += f"🍽 Daily Capacity: {ngo_details['daily_meal_capacity']} meals\n"
+    report += f"🎯 Focus Areas: {', '.join(json.loads(ngo_details['focus_areas'])) if ngo_details['focus_areas'] else 'General'}\n"
+    report += f"📊 Performance Score: {ngo_details['performance_score']:.1f}/5.0\n\n"
+    
+    # Activity metrics
+    report += f"📈 **Activity Metrics**\n"
+    report += f"- 📋 Total Claims: {activity['total_claims'] or 0}\n"
+    report += f"- ✅ Successful Claims: {activity['successful_claims'] or 0} ({success_rate:.1f}%)\n"
+    report += f"- 🍲 Meals Received: {activity['meals_received'] or 0}\n"
+    report += f"- ⏱ Avg Delivery Time: {activity['avg_hours_to_delivery'] or 0:.1f} hours\n"
+    report += f"- 📍 Avg Distance: {activity['avg_distance_km'] or 0:.1f} km\n"
+    report += f"- 🚛 Drivers Used: {activity['drivers_used'] or 0}\n"
+    report += f"- 🏢 Restaurants Worked With: {activity['restaurants_worked_with'] or 0}\n"
+    report += f"- 📊 Capacity Utilization: {utilization_rate:.1f}%\n\n"
+    
+    # Recent claims
+    report += f"📋 **Recent Claims**\n"
+    for claim in recent_claims:
+        status_emoji = "✅" if claim['status'] == 'DELIVERED' else "🔄"
+        report += f"{status_emoji} {claim['restaurant_name']}: {claim['quantity']} {claim['unit']} of {claim['description']}\n"
+        report += f"   🆔 {claim['claim_id']} | 📅 {claim['requested_at'][:10]}\n"
+    
+    # Top restaurants
+    if top_restaurants:
+        report += f"\n🏆 **Top Restaurant Partners**\n"
+        for i, r in enumerate(top_restaurants, 1):
+            report += f"{i}. {r['restaurant_name']}: {r['meals']} meals ({r['claims']} claims)\n"
+    
+    # Recommendations
+    report += f"\n💡 **Recommendations**\n"
+    if success_rate < 80:
+        report += "- Improve claim success rate by responding faster to listings\n"
+    if activity['avg_hours_to_delivery'] > 4:
+        report += "- Work with drivers to reduce delivery times\n"
+    if utilization_rate < 60:
+        report += "- Increase claim frequency to better utilize capacity\n"
+    
+    db.log_event("analytics", "ngo", "report_generated", {
+        "ngo_id": ngo['id'],
+        "period": period_title,
+        "meals_received": activity['meals_received'] or 0
+    })
+    
+    return report
+
 # --- Utility Functions ---
 def calculate_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     """Calculate distance between two points in kilometers"""
